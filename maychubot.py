@@ -13,6 +13,8 @@ from hoccauvip import STRATEGY_NAMES, strategy_predictions, ensemble_prediction
 import nhandiencau as acl
 import dataweb as guard
 from md5_server_engine import HASH_RE, scores288, weighted_result
+from live_signal_guard import gate_live
+import deploy_warmup as warmup
 
 BASE_DIR = Path(__file__).resolve().parent
 PORT = int(os.getenv('PORT','8080'))
@@ -673,6 +675,7 @@ def create_current_prediction(con,board,seq,meta_history=None):
     # Keep calibration conservative: retrospective strategy selection is not a
     # verified probability of a fair, independently random outcome.
     conf=min(55.0, 50.0+max(0.0,caudecision['historical_score']-.50)*35.0) if caudecision['champion'] else 50.0
+    audit=gate_live(con,board,len(seq),bool(caudecision.get('champion')))
     d={'board':board,'prediction':final,'confidence':conf,
        'agreement':round(e['agreement']*100,1),'source_len':len(seq),
        'strategy_count':e.get('strategy_count',len(STRATEGY_NAMES)),'memory':e.get('memory'),
@@ -683,7 +686,17 @@ def create_current_prediction(con,board,seq,meta_history=None):
        'cau_champion':caudecision['champion'],
        'cau_samples':caudecision['sample_count'],
        'cau_baseline':caudecision.get('baseline_score',.5),
-       'cau_top':caudecision['top']}
+       'cau_top':caudecision['top'],
+       'audit_signal_code':audit.get('signal_code'),
+       'audit_signal_reason':audit.get('signal_reason'),
+       'live_stats':audit.get('live_stats',{}),
+       'signal_is_win_probability':False,
+       'signal_status':'predict'}
+    # Expose the settled base round used for the NEXT forecast. This enables
+    # clients to detect stale/mismatched current-round data before display.
+    ordering='CAST(external_key AS INTEGER) DESC,id DESC' if board.startswith('sunwin:') else 'id DESC'
+    used=con.execute(f'SELECT external_key FROM rounds WHERE board=? ORDER BY {ordering} LIMIT 1',(board,)).fetchone()
+    d['base_key']=str(used['external_key']) if used else None
     con.execute('''
       INSERT INTO current_prediction(board,prediction,confidence,agreement,source_len,details_json,updated_at)
       VALUES(?,?,?,?,?,?,?)
@@ -769,12 +782,27 @@ def learn_rows(board,rows,source='unspecified'):
                             (board,key,final_pred,min(55.,50.+max(0.,decision['historical_score']-.50)*35.) if decision['champion'] else 50.0,actual,1 if final_pred==actual else 0,float(main.get('agreement',.5))*100,
                              json.dumps(main.get('memory'),ensure_ascii=False,separators=(',',':')) if main.get('memory') else None,now,
                              'live' if is_live else 'replay'))
+                # Invariants: only newly settled, genuinely pre-outcome LIVE
+                # forecasts issued in this deployment advance the 30-round gate.
+                if is_live:
+                    warmup.mark_forward_live(con,board,key,issued['created_at'],now)
             update_pattern_memory(con,board,seq,actual,now)
             con.execute('INSERT INTO rounds(board,external_key,result,meta_json,seen_at) VALUES(?,?,?,?,?)',(board,key,actual,json.dumps(item.get('meta') or {},ensure_ascii=False,separators=(',',':')),now))
             existing.add(key);seq.append(actual);meta_history.append(cur_meta);new_count+=1
             last_key=key;last_meta=cur_meta
         create_current_prediction(con,board,seq,meta_history);con.commit()
     return new_count
+
+
+def init_deploy_warmup():
+    """Initialize persistent display gating for this exact deployment."""
+    with db() as con:
+        warmup.ensure_schema(con)
+
+
+def warmup_for(board):
+    with db() as con:
+        return warmup.progress(con,board)
 
 
 def upgrade_existing_history():
@@ -861,16 +889,41 @@ def top_algo_payload(board=None,limit=20):
 
 
 def prediction_payload(board):
+    # Never stop the backend forecasts. Only hide the public prediction during
+    # the first 30 settled LIVE forecasts of THIS deployment and board.
+    gate=warmup_for(board)
     with LOCK:d=dict(LATEST.get(board) or {})
     if not d:
         with db() as con:r=con.execute('SELECT details_json FROM current_prediction WHERE board=?',(board,)).fetchone()
         if r:
             try:d=json.loads(r['details_json'])
             except Exception:d={}
-    if not d:return {'ok':False,'board':board,'error':'chưa đủ dữ liệu'}
-    out={'ok':True,**d}
+    if not d:
+        return {'ok':True,'board':board,'prediction':None,'display':'ĐANG ĐỒNG BỘ',
+                'prediction_bcr':None,'class':None,'signal_status':'warming',
+                'signal_reason':f'Đang thu thập dự đoán LIVE {gate["warmup_count"]}/{gate["warmup_target"]}',
+                **gate}
+    # Keep stale predictions visibly labeled, but never pretend cached values
+    # refer to a new live round. Cached forecast remains available post-warmup.
+    max_age=180 if board.startswith('sunwin:') else 900
+    age=time.time()-float(d.get('updated_at') or 0)
+    stale=age>max_age
+    out={'ok':True,**d,**gate,'stale':stale,
+         'signal_status':'predict' if gate['warmup_ready'] else 'warming',
+         'signal_reason':('Dữ liệu đã cũ, kiểm tra API trước khi sử dụng' if stale else
+                          'Đang chạy ngầm, chờ 30 dự đoán LIVE hoàn tất' if not gate['warmup_ready'] else
+                          'Đang dự đoán liên tục; điểm không phải xác suất thắng')}
+    if not gate['warmup_ready']:
+        # Do not leak hidden prediction through side-specific fields, details
+        # or top strategies while the 30-round display gate is closed.
+        for key in ('prediction','display','prediction_bcr','class','top','cau_top'):
+            out.pop(key,None)
+        out.update({'prediction':None,'display':f'KHỞI ĐỘNG {gate["warmup_count"]}/{gate["warmup_target"]}',
+                    'prediction_bcr':None,'class':None})
+        return out
     if board.startswith('baccarat:'):
-        out['prediction_bcr']='Banker' if d.get('prediction')=='TÀI' else 'Player';out['class']='B' if d.get('prediction')=='TÀI' else 'P'
+        out['prediction_bcr']='Banker' if d.get('prediction')=='TÀI' else 'Player'
+        out['class']='B' if d.get('prediction')=='TÀI' else 'P'
     else: out['display']='TÀI' if d.get('prediction')=='TÀI' else 'XỈU'
     return out
 
@@ -993,7 +1046,19 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload,dict):
                 raise ValueError('Payload không hợp lệ')
             if path=='/access/register':result=access_register(payload.get('token'))
-            elif path=='/api/md5/analyze':result=md5_analyze(fingerprint,payload.get('hash'))
+            elif path=='/api/md5/analyze':
+                result=md5_analyze(fingerprint,payload.get('hash'))
+                gate=warmup_for('sunwin:hu')
+                result.update(gate)
+                if not gate['warmup_ready']:
+                    # The server continues computing/logging MD5, but only
+                    # metadata is public before the LIVE display threshold.
+                    result={'ok':True,'kind':result['kind'],'learned':result.get('learned',0),
+                            **gate,'prediction':None,'signal_status':'warming',
+                            'signal_reason':'Chờ 30 phiên LIVE Sunwin từ Railway sau triển khai'}
+                else:
+                    result['signal_status']='predict'
+
             elif path=='/api/md5/learn':result=md5_learn(fingerprint,payload.get('hash'),payload.get('actual'))
             else:result=md5_import(fingerprint,payload.get('labels'))
             return self.send_bytes(200 if result.get('ok') else 400,json_bytes(result))
@@ -1024,6 +1089,12 @@ class Handler(BaseHTTPRequestHandler):
             c=cache_public('sun_history');return self.send_bytes(200 if c.get('ok') else 503,json_bytes(c))
         if path=='/api/bcr':
             c=cache_public('bcr');return self.send_bytes(200 if c.get('ok') else 503,json_bytes(c))
+        if path=='/api/warmup':
+            board=(qs.get('board') or ['sunwin:hu'])[0]
+            # Only expose board progress; no predictions prior to readiness.
+            if not (board=='sunwin:hu' or (board.startswith('baccarat:') and len(board)<=95)):
+                return self.send_bytes(400,json_bytes({'ok':False,'error':'Invalid board'}))
+            return self.send_bytes(200,json_bytes({'ok':True,'board':board,**warmup_for(board)}))
         if path=='/api/learning/summary':return self.send_bytes(200,json_bytes(summary_payload()))
         if path=='/api/learning/boards':return self.send_bytes(200,json_bytes({'ok':True,'boards':board_rows_payload()}))
         if path=='/api/learning/top':
@@ -1036,7 +1107,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_bytes(200,json_bytes({'ok':True,'predictions':{k:prediction_payload(k) for k in keys}}))
         if path=='/health':
             with LOCK:ls=dict(LEARN_STATUS)
-            return self.send_bytes(200,json_bytes({'ok':True,'brand':CONFIG.get('brand'),'cache':{k:{'ok':v.get('ok'),'ts':v.get('ts'),'error':v.get('error')} for k,v in CACHE.items()},'learning':ls,'summary':summary_payload()}))
+            return self.send_bytes(200,json_bytes({'ok':True,'brand':CONFIG.get('brand'),'cache':{k:{'ok':v.get('ok'),'ts':v.get('ts'),'error':v.get('error')} for k,v in CACHE.items()},'learning':ls,'warmup_sunwin':warmup_for('sunwin:hu'),'summary':summary_payload()}))
         return self.send_bytes(404,json_bytes({'ok':False,'error':'not found'}))
 
 
@@ -1299,6 +1370,7 @@ def admin_keyboard(page='home'):
     menus = {
         'home': [
             [b('📊 TỔNG QUAN', 'overview'), b('🎮 CÁC BÀN', 'boards')],
+            [b('🤖 TIẾN ĐỘ AUTO 30 PHIÊN', 'warmup')],
             [b('🩺 HỆ THỐNG', 'system'), b('🌐 QUẢN LÝ IP', 'ips')],
             [b('🔐 DUYỆT QUYỀN WEB', 'access')],
             [b('⚙️ CẤU HÌNH', 'settings'), b('📥 XUẤT TXT', 'export')],
@@ -1306,6 +1378,7 @@ def admin_keyboard(page='home'):
             [b('🔄 LÀM MỚI', 'home')],
         ],
         'access': [[b('🔄 TẢI YÊU CẦU', 'access')]],
+        'warmup': [[b('🔄 CẬP NHẬT 30 PHIÊN','warmup')]],
         'overview': [
             [b('🎯 LIVE', 'live'), b('📐 KIỂM ĐỊNH', 'quant')],
             [b('📊 HỌC CẦU', 'stats'), b('🏆 THUẬT TOÁN', 'algo')],
@@ -1394,6 +1467,7 @@ def admin_home():
         '━━━━━━━━━━━━━━━━━━━━\n'
         f'🎯 LIVE: <b>{s["live_predictions"]:,}</b> · <b>{live}</b>\n'
         f'📼 REPLAY: <b>{s["replay_predictions"]:,}</b>\n'
+        f'🤖 AUTO 30: <b>{warmup_for("sunwin:hu")["warmup_count"]}/30</b> · /warmup\n'
         f'🕒 <i>{stamp} (GMT+7)</i>\n\n'
         '<i>Chạm menu bên dưới để quản lý. LIVE khác REPLAY; tỷ lệ cũ không đảm bảo phiên sau.</i>'
     )
@@ -1589,6 +1663,20 @@ def data_audit_text():
     return '\n'.join(lines)[:3900]
 
 
+def warmup_admin_text():
+    sun=warmup_for('sunwin:hu')
+    with db() as con:
+        boards=[r[0] for r in con.execute("SELECT DISTINCT board FROM rounds WHERE board LIKE 'baccarat:%' ORDER BY board LIMIT 18")]
+    lines=['<b>🤖 AUTO DỰ ĐOÁN 24/24 · ĐỒNG BỘ SAU DEPLOY</b>',
+           '━━━━━━━━━━━━━━━━━━━━',
+           f'🎲 SUNWIN: <b>{sun["warmup_count"]}/{sun["warmup_target"]}</b> · '+('✅ ĐÃ HIỆN' if sun['warmup_ready'] else '⏳ ĐANG CHẠY NGẦM')]
+    for board in boards:
+        progress=warmup_for(board)
+        lines.append(f'🃏 {html.escape(board[9:])}: <b>{progress["warmup_count"]}/{progress["warmup_target"]}</b> · '+('✅' if progress['warmup_ready'] else '⏳'))
+    lines.append('\n<i>Chỉ đếm LIVE đã phát dự đoán trước khi kết quả được ghi nhận; không cộng phiên tải bù. Backend luôn tiếp tục dự đoán, kể cả khi web chưa hiện.</i>')
+    return '\n'.join(lines)[:3900]
+
+
 def stats_text():
     s=summary_payload();rate='—' if s['win_rate'] is None else f"{s['win_rate']}%";up=int(time.time()-s['learner']['started'])
     live_rate='—' if s['live_win_rate'] is None else f"{s['live_win_rate']}%"
@@ -1678,6 +1766,7 @@ async def handle_admin_message(client,m):
         elif cmd=='/system':out=admin_system_text()
         elif cmd in ('/status','/api'):out=api_status_text()
         elif cmd in ('/stats','/learn'):out=stats_text()
+        elif cmd in ('/warmup','/auto30'):out=warmup_admin_text()
         elif cmd in ('/live','/liveaudit'):out=v10_live_report()
         elif cmd in ('/loc','/qr'):out='🧧 Ăn Nhớ Lộc 🧧\nỦng hộ tự nguyện.'
         elif cmd in ('/quant','/modelcheck'):out=quant_report()
@@ -1724,7 +1813,7 @@ async def handle_admin_message(client,m):
     page=({'/bias':'bias','/modelhealth':'bias','/diagnose':'system','/exportmenu':'export',
            '/loc':'loc','/qr':'loc','/quant':'quant','/modelcheck':'quant','/ips':'ips','/ip':'ips','/banip':'ips','/unbanip':'ips','/live':'live','/liveaudit':'live','/dbstatus':'dbstatus','/auditdata':'auditdata','/dataaudit':'auditdata','/stats':'stats','/learn':'stats','/boards':'boards',
            '/panel':'overview','/overview':'overview','/help':'help','/huongdan':'help','/settings':'settings','/system':'system',
-           '/yeucau':'access','/quyenweb':'access','/capquyen':'access','/thuhoi':'access', '/algo':'algo','/topalgo':'algo','/api':'api','/status':'api','/links':'links'}).get(cmd,'home')
+           '/warmup':'warmup','/auto30':'warmup','/yeucau':'access','/quyenweb':'access','/capquyen':'access','/thuhoi':'access', '/algo':'algo','/topalgo':'algo','/api':'api','/status':'api','/links':'links'}).get(cmd,'home')
     await send_admin(client,chat_id,out,True,page)
 
 
@@ -1780,6 +1869,7 @@ async def handle_callback(client,q):
         return
     pages={
         'home':admin_home, 'overview':admin_overview_text, 'system':admin_system_text, 'access':access_pending_text,
+        'warmup':warmup_admin_text,
         'settings':admin_settings_text, 'help':admin_help_text,
         'iphelp':admin_ip_help_text, 'settingshelp':admin_settings_help_text,
         'quant':quant_report, 'ips':ip_overview, 'live':v10_live_report,
@@ -1843,7 +1933,7 @@ async def bot_loop():
 
 
 async def main_async():
-    load_config();ensure_db();upgrade_existing_history();load_latest_from_db();threading.Thread(target=run_http,daemon=True).start();await asyncio.gather(cache_loop(),bot_loop())
+    load_config();ensure_db();init_deploy_warmup();upgrade_existing_history();load_latest_from_db();threading.Thread(target=run_http,daemon=True).start();await asyncio.gather(cache_loop(),bot_loop())
 
 
 if __name__=='__main__':
