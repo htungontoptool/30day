@@ -2,7 +2,7 @@
 # External HTML can be hosted anywhere. This process provides API/cache/learning.
 # Run: python maychubot.py
 
-import os, re, json, time, math, html, asyncio, sqlite3, hashlib, threading, ipaddress, secrets
+import os, re, json, time, math, html, asyncio, sqlite3, hashlib, threading, ipaddress, secrets, io
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -1620,11 +1620,30 @@ def _parse_txt_limit(argument):
     return value
 
 
+# V22.1: Telegram long-poll timeout must EXCEED the server-side poll timeout.
+# Previously BOT_POLL_TIMEOUT=30 combined with httpx timeout=12s could
+# silently cancel getUpdates and make the admin bot appear unresponsive.
+_TG_LAST_ERROR={}
+def _tg_error(method,message):
+    now=time.monotonic()
+    if now-_TG_LAST_ERROR.get(method,0)>=60:
+        _TG_LAST_ERROR[method]=now
+        print(f'⚠ Telegram {method}: {str(message)[:150]}',flush=True)
+
 async def tg(client,method,payload):
     if not WEB_BOT_TOKEN:return None
+    timeout=httpx.Timeout(float(BOT_POLL_TIMEOUT+15),connect=10.0) if method=='getUpdates' else httpx.Timeout(17.0,connect=8.0)
     try:
-        r=await client.post(f'https://api.telegram.org/bot{WEB_BOT_TOKEN}/{method}',json=payload,timeout=12);j=r.json();return j.get('result') if j.get('ok') else None
-    except Exception:return None
+        r=await client.post(f'https://api.telegram.org/bot{WEB_BOT_TOKEN}/{method}',json=payload,timeout=timeout)
+        j=r.json()
+        if j.get('ok'):return j.get('result')
+        if method in ('getUpdates','getMe','deleteWebhook','setMyCommands'):
+            _tg_error(method,j.get('description','Telegram returned an error'))
+        return None
+    except Exception as exc:
+        if method in ('getUpdates','getMe','deleteWebhook','setMyCommands'):
+            _tg_error(method,type(exc).__name__)
+        return None
 
 
 def quant_report():
@@ -2357,6 +2376,8 @@ async def bot_loop():
         print('ℹ️ WEB_BOT_TOKEN chưa có: learner/API vẫn chạy, bot quản trị tắt.')
         while True:await asyncio.sleep(3600)
     async with httpx.AsyncClient(limits=httpx.Limits(max_connections=30,max_keepalive_connections=20)) as client:
+        me=await tg(client,'getMe',{})
+        if me:print('✅ Telegram bot online · '+str(me.get('username','unknown'))[:40],flush=True)
         await tg(client,'deleteWebhook',{'drop_pending_updates':False});await tg(client,'setMyName',{'name':'DEVELOPER THANHTUNG ADMIN'})
         await tg(client,'setMyCommands',{'commands':[
             {'command':'start','description':'🏠 Bảng điều khiển'},
