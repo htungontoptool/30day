@@ -1282,13 +1282,56 @@ def md5_import(token_hash,rows):
                     (token_hash,token_hash))
     return {'ok':True,'imported':count}
 
+# V22: public static mode can read only settled Sunwin rounds + game URL.
+# Prediction endpoints, raw cache, warmup and admin APIs require device/IP approval.
+# IP bans continue to override any grant.
+PUBLIC_SUNWIN_ENDPOINTS = frozenset({'/api/public/sunwin/rounds','/api/public/sunwin/config'})
+
+def static_public_rounds(limit=260):
+    """Settled results only. No private prediction, strategy weights or tokens."""
+    with db() as con:
+        rows=con.execute('''SELECT external_key,result,meta_json,seen_at FROM rounds
+            WHERE board='sunwin:hu' ORDER BY CAST(external_key AS INTEGER) DESC,id DESC LIMIT ?''',
+            (min(300,max(1,int(limit))),)).fetchall()
+    results=[]
+    for r in reversed(rows):
+        result=r['result']
+        if result not in ('TÀI','XỈU'):continue
+        try:meta=json.loads(r['meta_json'] or '{}')
+        except (ValueError,TypeError):meta={}
+        total=meta.get('total')
+        try:total=int(total) if total is not None else None
+        except (TypeError,ValueError):total=None
+        results.append({'session':str(r['external_key']),'result':result,
+                        'total':total,'seen_at':round(float(r['seen_at'] or 0))})
+    return {'ok':True,'source':'SETTLED_HISTORY_ONLY','rounds':results,
+            'updated_at':results[-1]['seen_at'] if results else None}
+
 class Handler(BaseHTTPRequestHandler):
     server_version='ThanhtungLearning/4.0-OMNIMAX'
     def log_message(self,fmt,*args): return
     def send_bytes(self,code,body,ctype='application/json; charset=utf-8'):
-        self.send_response(code);self.send_header('Content-Type',ctype);self.send_header('Content-Length',str(len(body)))
-        self.send_header('Cache-Control','no-store, no-cache, must-revalidate');self.send_header('Access-Control-Allow-Origin','*')
-        self.send_header('Access-Control-Allow-Methods','GET, POST, OPTIONS');self.send_header('Access-Control-Allow-Headers','Content-Type, X-Access-Token, X-Client-Threads');self.send_header('X-Content-Type-Options','nosniff');self.end_headers();self.wfile.write(body)
+        # Safari/mobile and reverse proxies often disconnect before a request finishes.
+        # This is normal client behaviour, not a worker crash. Avoid huge tracebacks.
+        try:
+            self.send_response(code)
+            self.send_header('Content-Type',ctype)
+            self.send_header('Content-Length',str(len(body)))
+            self.send_header('Cache-Control','no-store, no-cache, must-revalidate')
+            self.send_header('Access-Control-Allow-Origin','*')
+            self.send_header('Access-Control-Allow-Methods','GET, POST, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers','Content-Type, X-Access-Token, X-Client-Threads')
+            self.send_header('X-Content-Type-Options','nosniff')
+            self.end_headers()
+            if body:self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
+            self.close_connection=True
+            return
+        except OSError as exc:
+            if getattr(exc,'errno',None) in (32, 104, 103):  # EPIPE / ECONNRESET / ECONNABORTED
+                self.close_connection=True
+                return
+            raise
     def do_OPTIONS(self): self.send_bytes(204,b'','text/plain')
     def do_POST(self):
         path=urlparse(self.path).path.rstrip('/') or '/'
@@ -1354,11 +1397,16 @@ class Handler(BaseHTTPRequestHandler):
         if path=='/access/status':
             status=access_status(self.headers.get('X-Access-Token',''),ip)
             return self.send_bytes(200 if status.get('ok') else 401,json_bytes(status))
-        if path=='/config' or path.startswith('/api/'):
+        if (path=='/config' or path.startswith('/api/')) and path not in PUBLIC_SUNWIN_ENDPOINTS:
+            # V22: only settled-round public feed is free; predictions require approval.
             status=access_status(self.headers.get('X-Access-Token',''),ip)
             if not status.get('allowed'):
                 return self.send_bytes(403,json_bytes({'ok':False,'error':'Chua duoc cap quyen','status':status.get('status')}))
         if path=='/':return self.send_bytes(200,json_bytes({'ok':True,'service':'DEVELOPER THANHTUNG BACKEND','mode':'Sunwin 24/7 + MD5/SHA256','engine':'SUNWIN V15 · 6 nhóm','web':'host index externally'}))
+        if path=='/api/public/sunwin/config':
+            return self.send_bytes(200,json_bytes({'ok':True,'sunwin_game_url':public_config().get('sunwin_game_url','')}))
+        if path=='/api/public/sunwin/rounds':
+            return self.send_bytes(200,json_bytes(static_public_rounds()))
         if path=='/config':return self.send_bytes(200,json_bytes({'ok':True,**public_config()}))
         if path=='/api/sun/current':
             c=cache_public('sun_current');return self.send_bytes(200 if c.get('ok') else 503,json_bytes(c))
