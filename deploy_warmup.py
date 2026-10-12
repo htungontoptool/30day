@@ -57,4 +57,4 @@ def progress(con, board):
                       (DEPLOYMENT_KEY, str(board))).fetchone()[0])
     count=min(n, TARGET)
     return {'warmup_count':count,'warmup_target':TARGET,'warmup_remaining':max(0,TARGET-count),
-            'warmup_ready':count >= TARGET,'warmup_state':'ready' if n>=TARGET else 'warming'}
+            'warmup_ready':count >= TARGET,warmup_state':'ready' if n>=TARGET else 'warming'}
