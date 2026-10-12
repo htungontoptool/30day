@@ -65,7 +65,7 @@ def choose(seq, stats=None):
     agree=vote[pred]/total if total else .5
     return {'prediction':pred,'strategy':'SIX_EXPERT_SHRUNK_VOTE',
             'model_scores':sc,'agreement':round(agree,3),'engine':'V15',
-            'evidence':'BACKTEST_PLUS_LIVE_NOT_VALIDATED',
+            'evidence':'LIVE_ONLY_NOT_VALIDATED',
             'signal_is_win_probability':False}
 
 
@@ -90,8 +90,12 @@ def ensure_schema(con):
 def load_stats(con,board,limit=160):
     out={name:[] for name in NAMES}
     for name in NAMES:
-        rows=con.execute('''SELECT ok FROM v15_expert_log WHERE board=? AND strategy=?
-          ORDER BY CAST(external_key AS INTEGER) DESC LIMIT ?''',(board,name,limit)).fetchall()
+        # Weight experts only from forecasts truly issued before settlement.
+        # REPLAY is kept for diagnostics but must not train the live selector.
+        rows=con.execute('''SELECT ok FROM v15_expert_log
+          WHERE board=? AND strategy=? AND source='live'
+          ORDER BY CAST(external_key AS INTEGER) DESC LIMIT ?''',
+          (board,name,limit)).fetchall()
         out[name]=[int(x[0]) for x in reversed(rows)]
     return out
 
