@@ -1,2 +1,2 @@
 # 30day
-Fix Railway build
+Railway rebuild after syntax fix
