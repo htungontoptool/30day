@@ -1,159 +1,198 @@
-"""V15 Sunwin: auditable causal, low-correlation next-round hypotheses.
+"""V25 Sunwin next-round hypothesis engine.
 
-Always returns TÀI/XỈU. This module does not claim a statistical edge against
-independent random dice. It records individual expert forecasts before their
-outcome and never mistakes historical replay for verified LIVE performance.
+Uses *only prior settled rounds* for candidate signals; adapts modestly from
+pre-outcome LIVE expert scores. Does not claim to predict independent random dice
+better than chance. Keeps V15 public function names for maychubot.py compatibility.
 """
-import math
 import json
-from collections import Counter
+import math
 
 T, X = 'TÀI', 'XỈU'
-VERSION='V15'
-NAMES=('FOLLOW','REVERSE','LAST24','MARKOV1','MARKOV2','RUN_STATE')
+VERSION = 'V25'
+NAMES = ('FOLLOW', 'REVERSE', 'LAST24', 'MARKOV1', 'MARKOV2', 'RUN_STATE')
+_BASE = {'FOLLOW': .65, 'REVERSE': .65, 'LAST24': 1.0,
+         'MARKOV1': 1.10, 'MARKOV2': .90, 'RUN_STATE': 1.0}
+
+
+def _context(seq):
+    seq = [v for v in seq if v in (T, X)]
+    if not seq:
+        return {}, {}
+    n = len(seq)
+    last = seq[-1]
+    recent = seq[-24:]
+    count_t = recent.count(T)
+    freq = T if count_t > len(recent) - count_t else X if count_t < len(recent) - count_t else last
+    run = 1
+    for item in reversed(seq[:-1]):
+        if item != last:
+            break
+        run += 1
+
+    counts = {}
+    def conditional(order):
+        if n <= order:
+            counts[order] = 0
+            return freq
+        pattern = seq[-order:]
+        a = b = 0
+        for j in range(max(order, n - 240), n):
+            if seq[j - order:j] == pattern:
+                if seq[j] == T:
+                    a += 1
+                else:
+                    b += 1
+        support = a + b
+        counts[order] = support
+        # If this exact context is unproven, keep the vote but reduce its weight.
+        if support < 8 or abs(a - b) <= 1:
+            return freq
+        return T if a > b else X
+
+    votes = {'FOLLOW': last, 'REVERSE': X if last == T else T,
+             'LAST24': freq, 'MARKOV1': conditional(1),
+             'MARKOV2': conditional(2),
+             'RUN_STATE': X if run >= 4 and last == T else T if run >= 4 else last}
+    supports = {'MARKOV1': counts.get(1, 0), 'MARKOV2': counts.get(2, 0)}
+    return votes, supports
 
 
 def candidates(seq):
-    seq=[x for x in seq if x in (T,X)]
-    if not seq: return {}
-    tail=seq[-1]; n=len(seq)
-    short=seq[-24:]
-    t=short.count(T);x=len(short)-t
-    frequency=T if t>x else X if x>t else tail
-    def markov(order):
-        # Beta(3,3) shrinkage, fixed lookback; no current/future outcome included.
-        if n<order+15:return frequency
-        context=seq[-order:]; a=b=3
-        # historical outcomes only, including latest occurrence prefix
-        for i in range(max(order,n-240),n):
-            if seq[i-order:i]==context:
-                if seq[i]==T:a+=1
-                else:b+=1
-        if a+b < 16 or abs(a-b) < 3:return frequency
-        return T if a>b else X
-    run=1
-    for v in reversed(seq[:-1]):
-        if v!=tail:break
-        run+=1
-    return {'FOLLOW':tail,'REVERSE':X if tail==T else T,
-            'LAST24':frequency,'MARKOV1':markov(1),'MARKOV2':markov(2),
-            'RUN_STATE':(X if tail==T else T) if run>=4 else tail}
+    return _context(seq)[0]
 
 
-def choose(seq, stats=None):
-    """Online shrunk expert vote, max one vote per independent hypothesis.
-
-    stats[nm] is list of 0/1 correctness from older prequential forecasts,
-    ordered from oldest to newest. Conservative weights cannot claim real odds.
-    """
-    d=candidates(seq)
-    if not d:return {'prediction':T,'strategy':'COLD','model_scores':{},'agreement':.5,'engine':'V15','evidence':'NO_HISTORY'}
-    stats=stats or {}
-    vote={T:0.,X:0.};sc={}
-    for name,pred in d.items():
-        obs=list(stats.get(name) or [])[-160:]
-        n=len(obs);w=sum(obs)
-        posterior=(w+12.)/(n+24.)
-        # Strong prior for 50%; cap possible effect of noisy historic streaks.
-        reliability=min(1.,n/80.)
-        weight=max(.65,min(1.35,1.+1.3*reliability*(posterior-.5)))
-        vote[pred]+=weight
-        sc[name]={'n':n,'correct':w,'historical_rate':round(w/n*100,1) if n else None,
-                  'weight':round(weight,3),'prediction':pred}
-    fallback=d['LAST24'];pred=T if vote[T]>vote[X] else X if vote[X]>vote[T] else fallback
-    total=vote[T]+vote[X]
-    agree=vote[pred]/total if total else .5
-    return {'prediction':pred,'strategy':'SIX_EXPERT_SHRUNK_VOTE',
-            'model_scores':sc,'agreement':round(agree,3),'engine':'V15',
-            'evidence':'LIVE_ONLY_NOT_VALIDATED',
-            'signal_is_win_probability':False}
-
-
-def ensure_schema(con):
-    con.executescript('''
-    CREATE TABLE IF NOT EXISTS v15_issued_experts (
-      board TEXT NOT NULL, base_key TEXT NOT NULL, forecasts_json TEXT NOT NULL,
-      created_at REAL NOT NULL, PRIMARY KEY(board,base_key)
-    );
-    CREATE TABLE IF NOT EXISTS v15_expert_log (
-      board TEXT NOT NULL, external_key TEXT NOT NULL, strategy TEXT NOT NULL,
-      prediction TEXT NOT NULL, actual TEXT NOT NULL, ok INTEGER NOT NULL,
-      source TEXT NOT NULL CHECK(source IN ('live','replay')),
-      created_at REAL NOT NULL,
-      PRIMARY KEY(board,external_key,strategy)
-    );
-    CREATE INDEX IF NOT EXISTS idx_v15_expert_board
-      ON v15_expert_log(board,strategy,created_at);
-    ''')
-
-
-def load_stats(con,board,limit=160):
-    out={name:[] for name in NAMES}
-    for name in NAMES:
-        # Weight experts only from forecasts truly issued before settlement.
-        # REPLAY is kept for diagnostics but must not train the live selector.
-        rows=con.execute('''SELECT ok FROM v15_expert_log
-          WHERE board=? AND strategy=? AND source='live'
-          ORDER BY CAST(external_key AS INTEGER) DESC LIMIT ?''',
-          (board,name,limit)).fetchall()
-        out[name]=[int(x[0]) for x in reversed(rows)]
+def weights(seq, stats=None):
+    """Non-leaky, reliability-limited expert weights for transparent UI/debugging."""
+    candidates_now, supports = _context(seq)
+    stats = stats or {}
+    out = {}
+    for name, prediction in candidates_now.items():
+        obs = list(stats.get(name) or [])[-160:]
+        n = len(obs)
+        correct = sum(1 for x in obs if x)
+        # Shrink strongly to the 50% baseline; only use samples verified LIVE.
+        rate = (correct + 18.0) / (n + 36.0)
+        adaptive = max(.82, min(1.18, 1.0 + (rate - .5) * 2.0)) if n >= 36 else 1.0
+        enough = 1.0
+        if name == 'MARKOV1':
+            enough = min(1.0, max(.12, supports.get('MARKOV1', 0) / 14.0))
+        elif name == 'MARKOV2':
+            enough = min(1.0, max(.12, supports.get('MARKOV2', 0) / 10.0))
+        final = _BASE[name] * enough * adaptive
+        out[name] = {'prediction': prediction, 'n': n, 'correct': correct,
+                     'historical_rate': round(100 * correct / n, 1) if n else None,
+                     'weight': round(final, 4),
+                     'context_samples': supports.get(name) if name.startswith('MARKOV') else None}
     return out
 
 
-def seal_forecast(con,board,base_key,preds,issued_time):
-    """Immutable, stamped BEFORE result. Reboots cannot rewrite shadow experts."""
-    valid={k:v for k,v in preds.items() if k in NAMES and v in (T,X)}
-    if not valid:return
-    con.execute('INSERT OR IGNORE INTO v15_issued_experts '
-        '(board,base_key,forecasts_json,created_at) VALUES(?,?,?,?)',
-        (board,str(base_key),json.dumps(valid,ensure_ascii=False),float(issued_time)))
+def choose(seq, stats=None):
+    scores = weights(seq, stats)
+    if not scores:
+        return {'prediction': T, 'strategy': 'COLD_START', 'model_scores': {},
+                'agreement': .5, 'engine': VERSION, 'evidence': 'NO_HISTORY',
+                'signal_is_win_probability': False}
+    total = {T: 0.0, X: 0.0}
+    for data in scores.values():
+        total[data['prediction']] += float(data['weight'])
+    fallback = candidates(seq)['LAST24']
+    outcome = T if total[T] > total[X] else X if total[X] > total[T] else fallback
+    summed = total[T] + total[X]
+    # This is weighted agreement, not winning probability.
+    agreement = round(total[outcome] / summed, 3) if summed else .5
+    return {'prediction': outcome, 'strategy': 'V25_CAUSAL_WEIGHTED_EXPERTS',
+            'model_scores': scores, 'agreement': agreement,
+            'engine': VERSION, 'evidence': 'LIVE_ONLY_UNVALIDATED',
+            'signal_is_win_probability': False}
 
 
-def issued_forecast(con,board,base_key,settled_time):
-    row=con.execute('SELECT forecasts_json,created_at FROM v15_issued_experts '
-        'WHERE board=? AND base_key=?',(board,str(base_key))).fetchone()
-    if not row or float(row[1]) >= float(settled_time):return None
+def ensure_schema(con):
+    # New versioned tables: old V15/V24 labels are preserved, never fed into V25.
+    con.executescript('''
+    CREATE TABLE IF NOT EXISTS v25_issued_experts (
+        board TEXT NOT NULL, base_key TEXT NOT NULL,
+        forecasts_json TEXT NOT NULL, created_at REAL NOT NULL,
+        PRIMARY KEY(board, base_key)
+    );
+    CREATE TABLE IF NOT EXISTS v25_expert_log (
+        board TEXT NOT NULL, external_key TEXT NOT NULL,
+        strategy TEXT NOT NULL, prediction TEXT NOT NULL,
+        actual TEXT NOT NULL, ok INTEGER NOT NULL,
+        source TEXT NOT NULL CHECK(source IN ('live','replay')),
+        created_at REAL NOT NULL,
+        PRIMARY KEY(board,external_key,strategy)
+    );
+    CREATE INDEX IF NOT EXISTS idx_v25_expert_board
+        ON v25_expert_log(board, strategy, source, external_key);
+    ''')
+
+
+def load_stats(con, board, limit=160):
+    out = {name: [] for name in NAMES}
+    for name in NAMES:
+        rows = con.execute('''SELECT ok FROM v25_expert_log
+           WHERE board=? AND strategy=? AND source='live'
+           ORDER BY CAST(external_key AS INTEGER) DESC LIMIT ?''',
+           (board, name, limit)).fetchall()
+        out[name] = [int(row[0]) for row in reversed(rows)]
+    return out
+
+
+def seal_forecast(con, board, base_key, preds, issued_time):
+    valid = {name: side for name, side in preds.items() if name in NAMES and side in (T, X)}
+    if valid:
+        con.execute('INSERT OR IGNORE INTO v25_issued_experts '
+                    '(board,base_key,forecasts_json,created_at) VALUES(?,?,?,?)',
+                    (board, str(base_key), json.dumps(valid, ensure_ascii=False), float(issued_time)))
+
+
+def issued_forecast(con, board, base_key, settled_time):
+    row = con.execute('SELECT forecasts_json,created_at FROM v25_issued_experts '
+                      'WHERE board=? AND base_key=?', (board, str(base_key))).fetchone()
+    if not row or float(row[1]) >= float(settled_time):
+        return None
     try:
-        preds=json.loads(row[0]);return {k:v for k,v in preds.items() if k in NAMES and v in (T,X)}
-    except (ValueError,TypeError):return None
+        p = json.loads(row[0])
+        return {k: v for k, v in p.items() if k in NAMES and v in (T, X)}
+    except (ValueError, TypeError):
+        return None
 
 
-def save_result(con,board,key,preds,actual,is_live,settled_time):
-    if actual not in (T,X):return
-    source='live' if is_live else 'replay'
-    con.executemany('''INSERT OR IGNORE INTO v15_expert_log
-    (board,external_key,strategy,prediction,actual,ok,source,created_at)
-    VALUES(?,?,?,?,?,?,?,?)''',
-     [(board,str(key),nm,p,actual,int(p==actual),source,float(settled_time))
-       for nm,p in preds.items() if nm in NAMES and p in (T,X)])
+def save_result(con, board, key, preds, actual, is_live, settled_time):
+    if actual not in (T, X):
+        return
+    source = 'live' if is_live else 'replay'
+    con.executemany('''INSERT OR IGNORE INTO v25_expert_log
+        (board,external_key,strategy,prediction,actual,ok,source,created_at)
+        VALUES(?,?,?,?,?,?,?,?)''',
+        [(board, str(key), name, side, actual, int(side == actual), source, float(settled_time))
+         for name, side in preds.items() if name in NAMES and side in (T, X)])
 
 
-def audit(con,board='sunwin:hu'):
-    rows=con.execute('''SELECT source,COUNT(DISTINCT external_key), SUM(ok) FROM v15_expert_log
-        WHERE board=? AND strategy=? GROUP BY source''',(board,'LAST24')).fetchall()
-    counts={r[0]:{'rounds':int(r[1]),'correct':int(r[2] or 0)} for r in rows}
-    return counts
+def audit(con, board='sunwin:hu'):
+    rows = con.execute('''SELECT source,COUNT(DISTINCT external_key),SUM(ok)
+        FROM v25_expert_log WHERE board=? AND strategy='LAST24'
+        GROUP BY source''', (board,)).fetchall()
+    return {row[0]: {'rounds': int(row[1]), 'correct': int(row[2] or 0)} for row in rows}
 
 
 def bootstrap(con, board='sunwin:hu'):
-    """One-time prequential replay with gap-aware reset; replay NEVER counted LIVE.
-
-    Historical rows may be ordered and evaluated causally but do not establish
-    what the production server truly forecast before actual settlement.
-    """
-    check=con.execute("SELECT 1 FROM v15_expert_log WHERE board=? LIMIT 1",(board,)).fetchone()
-    if check:return 0
-    rows=con.execute('''SELECT external_key,result,seen_at FROM rounds WHERE board=?
-                          ORDER BY CAST(external_key AS INTEGER),id''',(board,)).fetchall()
-    hist=[];last=None;n=0
+    if con.execute('SELECT 1 FROM v25_expert_log WHERE board=? LIMIT 1', (board,)).fetchone():
+        return 0
+    rows = con.execute('''SELECT external_key,result,seen_at FROM rounds
+       WHERE board=? ORDER BY CAST(external_key AS INTEGER),id''', (board,)).fetchall()
+    history = []
+    prev = None
+    n = 0
     for r in rows:
-        key=str(r['external_key']);actual=r['result']
-        if last is not None and (not key.isdigit() or not last.isdigit() or int(key)!=int(last)+1):
-            hist=[]
-        if len(hist)>=12 and actual in (T,X):
-            preds=candidates(hist)
-            save_result(con,board,key,preds,actual,False,float(r['seen_at'] or 0))
-            n+=1
-        if actual in (T,X):hist.append(actual)
-        last=key
+        key = str(r['external_key'])
+        actual = r['result']
+        if prev is not None and (not prev.isdigit() or not key.isdigit() or int(key) != int(prev) + 1):
+            history = []
+        if len(history) >= 12 and actual in (T, X):
+            save_result(con, board, key, candidates(history), actual, False, float(r['seen_at'] or 0))
+            n += 1
+        if actual in (T, X):
+            history.append(actual)
+        prev = key
     return n
