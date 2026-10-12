@@ -113,11 +113,19 @@ def prepare(con, board, rows, source, now, last_key):
     the current batch are compared as well, so contradictory duplicates don't
     get silently reduced to one value by the normalizer.
     """
+    # Compare ONLY keys provided by the current API payload. Reading ALL
+    # historical SQLite rounds every 0.55s grows linearly without bound.
     stored = {}
-    for r in con.execute('SELECT external_key,result,meta_json FROM rounds WHERE board=?', (board,)):
-        try: meta = json.loads(r['meta_json'] or '{}')
-        except (ValueError, TypeError): meta = {}
-        stored[str(r['external_key'])] = {'result':r['result'], 'meta':meta}
+    incoming_keys=list(dict.fromkeys(str(r.get('key','')).strip() for r in rows))
+    for pos in range(0,len(incoming_keys),400):
+        part=incoming_keys[pos:pos+400]
+        if not part:continue
+        qs=','.join('?' for _ in part)
+        for r in con.execute('SELECT external_key,result,meta_json FROM rounds '
+                             'WHERE board=? AND external_key IN ('+qs+')', (board,*part)):
+            try: meta = json.loads(r['meta_json'] or '{}')
+            except (ValueError, TypeError): meta = {}
+            stored[str(r['external_key'])] = {'result':r['result'], 'meta':meta}
     accepted = []
     new_ids = set()
     high = int(last_key) if board.startswith('sunwin:') and SID_RE.fullmatch(str(last_key or '')) else None
